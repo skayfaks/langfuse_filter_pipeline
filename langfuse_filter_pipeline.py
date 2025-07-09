@@ -1,49 +1,95 @@
 """
 title: Langfuse Filter Pipeline
-author: AI
+author: open-webui
 date: 2025-07-09
 version: 1.7
 license: MIT
 description: A filter pipeline that uses Langfuse.
-type: filter
 requirements: langfuse
 """
+
+from typing import List, Optional
+import os
 import uuid
-from typing import Optional
+import json
+
 from pydantic import BaseModel
-
 from langfuse import Langfuse
-from langfuse.api.resources.public import UnauthorizedError
-from openwebui.pipelines import Pipeline as BasePipeline
+from langfuse.api.resources.commons.errors.unauthorized_error import UnauthorizedError
 
-class Valves(BaseModel):
-    secret_key: str
-    public_key: str
-    host: str
-    debug: bool = False
-    use_model_name_instead_of_id_for_generation: bool = False
 
-class Pipeline(BasePipeline):
-    def __init__(self, valves=None, model_names=None, log_func=None, generation_tasks=None):
-        # Если valves не переданы, используем дефолтные значения (для UI)
-        if valves is None:
-            self.valves = Valves(
-                secret_key="",
-                public_key="",
-                host="https://cloud.langfuse.com",
-                debug=False,
-                use_model_name_instead_of_id_for_generation=False
-            )
-        elif isinstance(valves, dict):
-            self.valves = Valves(**valves)
-        else:
-            self.valves = valves
+def get_last_assistant_message(messages: List[dict]) -> str:
+    """Retrieve the last assistant message content from the message list."""
+    for message in reversed(messages):
+        if message["role"] == "assistant":
+            return message.get("content", "")
+    return ""
 
-        self.model_names = model_names or {}
-        self.log = log_func or (lambda *a, **k: None)
-        self.GENERATION_TASKS = generation_tasks or {"llm_response"}
+
+def get_last_assistant_message_obj(messages: List[dict]) -> dict:
+    """Retrieve the last assistant message from the message list."""
+    for message in reversed(messages):
+        if message["role"] == "assistant":
+            return message
+    return {}
+
+
+class Pipeline:
+    class Valves(BaseModel):
+        pipelines: List[str] = []
+        priority: int = 0
+        secret_key: str
+        public_key: str
+        host: str
+        # Valve that controls whether task names are added as tags:
+        insert_tags: bool = True
+        # Valve that controls whether to use model name instead of model ID for generation
+        use_model_name_instead_of_id_for_generation: bool = False
+        debug: bool = False
+
+    def __init__(self):
+        self.type = "filter"
+        self.name = "Langfuse Filter"
+
+        self.valves = self.Valves(
+            **{
+                "pipelines": ["*"],
+                "secret_key": os.getenv("LANGFUSE_SECRET_KEY", "your-secret-key-here"),
+                "public_key": os.getenv("LANGFUSE_PUBLIC_KEY", "your-public-key-here"),
+                "host": os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com"),
+                "use_model_name_instead_of_id_for_generation": os.getenv("USE_MODEL_NAME", "false").lower() == "true",
+                "debug": os.getenv("DEBUG_MODE", "false").lower() == "true",
+            }
+        )
+
+        self.langfuse = None
         self.chat_traces = {}
+        self.suppressed_logs = set()
+        # Dictionary to store model names for each chat
+        self.model_names = {}
 
+        # Only these tasks will be treated as LLM "generations":
+        self.GENERATION_TASKS = {"llm_response"}
+
+    def log(self, message: str, suppress_repeats: bool = False):
+        if self.valves.debug:
+            if suppress_repeats:
+                if message in self.suppressed_logs:
+                    return
+                self.suppressed_logs.add(message)
+            print(f"[DEBUG] {message}")
+
+    async def on_startup(self):
+        self.log(f"on_startup запущен для {__name__}")
+        self.set_langfuse()
+
+    async def on_shutdown(self):
+        self.log(f"on_shutdown запущен для {__name__}")
+        if self.langfuse:
+            self.langfuse.flush()
+
+    async def on_valves_updated(self):
+        self.log("Настройки обновлены, перезапуск клиента Langfuse.")
         self.set_langfuse()
 
     def set_langfuse(self):
@@ -55,38 +101,93 @@ class Pipeline(BasePipeline):
                 debug=self.valves.debug,
             )
             self.langfuse.auth_check()
-            self.log("Langfuse клиент успешно инициализирован.")
+            self.log("Клиент Langfuse успешно инициализирован.")
         except UnauthorizedError:
-            print("Неверные учетные данные Langfuse. Проверьте настройки.")
+            print(
+                "Неверные учетные данные Langfuse. Пожалуйста, введите корректные данные в настройках."
+            )
         except Exception as e:
-            print(f"Ошибка Langfuse: {e}")
+            print(
+                f"Ошибка Langfuse: {e}. Пожалуйста, проверьте настройки."
+            )
 
-    async def on_valves_updated(self, valves):
-        """Этот метод вызывается Open WebUI при изменении переменных через UI."""
-        if isinstance(valves, dict):
-            self.valves = Valves(**valves)
-        else:
-            self.valves = valves
-        self.set_langfuse()
+    def _build_tags(self, task_name: str) -> list:
+        """
+        Создает список тегов на основе настроек, всегда добавляя
+        'open-webui' и пропуская user_response / llm_response.
+        """
+        tags_list = []
+        if self.valves.insert_tags:
+            # Всегда добавляем 'open-webui'
+            tags_list.append("open-webui")
+            # Добавляем task_name если это не один из исключенных
+            if task_name not in ["user_response", "llm_response"]:
+                tags_list.append(task_name)
+        return tags_list
 
     async def inlet(self, body: dict, user: Optional[dict] = None) -> dict:
-        chat_id = body.get("chat_id")
-        task_name = body.get("task_name")
-        user_email = user.get("email") if user else "anonymous"
-        metadata = {}
-        tags_list = body.get("tags")
+        if self.valves.debug:
+            print(f"[DEBUG] Получен запрос: {json.dumps(body, indent=2)}")
+
+        self.log(f"Функция inlet вызвана с body: {body} и user: {user}")
+
+        metadata = body.get("metadata", {})
+        chat_id = metadata.get("chat_id", str(uuid.uuid4()))
+
+        # Обработка временных чатов
+        if chat_id == "local":
+            session_id = metadata.get("session_id")
+            chat_id = f"temporary-session-{session_id}"
+
+        metadata["chat_id"] = chat_id
+        body["metadata"] = metadata
+
+        # Извлекаем и сохраняем имя модели и ID
+        model_info = metadata.get("model", {})
+        model_id = body.get("model")
+        
+        # Сохраняем информацию о модели для этого чата
+        if chat_id not in self.model_names:
+            self.model_names[chat_id] = {"id": model_id}
+        else:
+            self.model_names[chat_id]["id"] = model_id
+            
+        if isinstance(model_info, dict) and "name" in model_info:
+            self.model_names[chat_id]["name"] = model_info["name"]
+            self.log(f"Сохранена информация о модели - name: '{model_info['name']}', id: '{model_id}' для chat_id: {chat_id}")
+
+        required_keys = ["model", "messages"]
+        missing_keys = [key for key in required_keys if key not in body]
+        if missing_keys:
+            error_message = f"Ошибка: Отсутствуют ключи в запросе: {', '.join(missing_keys)}"
+            self.log(error_message)
+            raise ValueError(error_message)
+
+        user_email = user.get("email") if user else None
+        # По умолчанию 'user_response' если задача не указана
+        task_name = metadata.get("task", "user_response")
+
+        # Создаем теги
+        tags_list = self._build_tags(task_name)
 
         if chat_id not in self.chat_traces:
             self.log(f"Создаем новый trace для chat_id: {chat_id}")
 
-            trace = self.langfuse.create_trace(
-                name=f"chat:{chat_id}",
-                input=body,
-                user_id=user_email,
-                metadata=metadata,
-                session_id=chat_id,
-                tags=tags_list
-            )
+            trace_payload = {
+                "name": f"chat:{chat_id}",
+                "input": body,
+                "user_id": user_email,
+                "metadata": metadata,
+                "session_id": chat_id,
+            }
+
+            if tags_list:
+                trace_payload["tags"] = tags_list
+
+            if self.valves.debug:
+                print(f"[DEBUG] Запрос trace Langfuse: {json.dumps(trace_payload, indent=2)}")
+
+            trace = self.langfuse.trace(**trace_payload)
             self.chat_traces[chat_id] = trace
         else:
             trace = self.chat_traces[chat_id]
@@ -94,47 +195,79 @@ class Pipeline(BasePipeline):
             if tags_list:
                 trace.update(tags=tags_list)
 
-        if task_name in self.GENERATION_TASKS:
-            model_id = self.model_names.get(chat_id, {}).get("id", body.get("model"))
-            model_name = self.model_names.get(chat_id, {}).get("name", "unknown")
-            model_value = model_name if self.valves.use_model_name_instead_of_id_for_generation else model_id
+        # Обновляем метаданные с типом
+        metadata["type"] = task_name
+        metadata["interface"] = "open-webui"
 
+        # Если это задача, которая считается LLM "generation"
+        if task_name in self.GENERATION_TASKS:
+            # Определяем, какое значение модели использовать
+            model_id = self.model_names.get(chat_id, {}).get("id", body["model"])
+            model_name = self.model_names.get(chat_id, {}).get("name", "unknown")
+            
+            # Выбираем основной идентификатор модели на основе настроек
+            model_value = model_name if self.valves.use_model_name_instead_of_id_for_generation else model_id
+            
+            # Добавляем оба значения в метаданные
             metadata["model_id"] = model_id
             metadata["model_name"] = model_name
+            
+            generation_payload = {
+                "name": f"{task_name}:{str(uuid.uuid4())}",
+                "model": model_value,
+                "input": body["messages"],
+                "metadata": metadata,
+            }
+            if tags_list:
+                generation_payload["tags"] = tags_list
 
-            self.langfuse.create_generation(
-                trace_id=trace.id,
-                name=f"{task_name}:{str(uuid.uuid4())}",
-                model=model_value,
-                input=body["messages"],
-                metadata=metadata,
-                tags=tags_list
-            )
+            if self.valves.debug:
+                print(f"[DEBUG] Запрос generation Langfuse: {json.dumps(generation_payload, indent=2)}")
+
+            trace.generation(**generation_payload)
         else:
-            self.langfuse.create_event(
-                trace_id=trace.id,
-                name=f"{task_name}:{str(uuid.uuid4())}",
-                metadata=metadata,
-                input=body["messages"],
-                tags=tags_list
-            )
+            # Иначе записываем как событие
+            event_payload = {
+                "name": f"{task_name}:{str(uuid.uuid4())}",
+                "metadata": metadata,
+                "input": body["messages"],
+            }
+            if tags_list:
+                event_payload["tags"] = tags_list
+
+            if self.valves.debug:
+                print(f"[DEBUG] Запрос event Langfuse: {json.dumps(event_payload, indent=2)}")
+
+            trace.event(**event_payload)
 
         return body
 
     async def outlet(self, body: dict, user: Optional[dict] = None) -> dict:
+        self.log(f"Функция outlet вызвана с body: {body}")
+
         chat_id = body.get("chat_id")
-        task_name = body.get("task_name")
-        metadata = {}
-        tags_list = body.get("tags")
+
+        # Обработка временных чатов
+        if chat_id == "local":
+            session_id = body.get("session_id")
+            chat_id = f"temporary-session-{session_id}"
+
+        metadata = body.get("metadata", {})
+        # По умолчанию 'llm_response' если задача не указана
+        task_name = metadata.get("task", "llm_response")
+
+        # Создаем теги
+        tags_list = self._build_tags(task_name)
 
         if chat_id not in self.chat_traces:
-            self.log(f"[WARNING] Нет trace для chat_id: {chat_id}, повторно регистрируем.")
+            self.log(f"[WARNING] Не найден trace для chat_id: {chat_id}, пытаемся перерегистрировать.")
+            # Повторно запускаем inlet для регистрации
             return await self.inlet(body, user)
 
         trace = self.chat_traces[chat_id]
 
-        assistant_message = self.get_last_assistant_message(body["messages"])
-        assistant_message_obj = self.get_last_assistant_message_obj(body["messages"])
+        assistant_message = get_last_assistant_message(body["messages"])
+        assistant_message_obj = get_last_assistant_message_obj(body["messages"])
 
         usage = None
         if assistant_message_obj:
@@ -150,46 +283,59 @@ class Pipeline(BasePipeline):
                     }
                     self.log(f"Извлечена статистика токенов: {usage}")
 
+        # Обновляем выходные данные trace с последним сообщением ассистента
         trace.update(output=assistant_message)
 
         metadata["type"] = task_name
         metadata["interface"] = "open-webui"
 
         if task_name in self.GENERATION_TASKS:
+            # Определяем, какое значение модели использовать
             model_id = self.model_names.get(chat_id, {}).get("id", body.get("model"))
             model_name = self.model_names.get(chat_id, {}).get("name", "unknown")
+            
+            # Выбираем основной идентификатор модели на основе настроек
             model_value = model_name if self.valves.use_model_name_instead_of_id_for_generation else model_id
-
+            
+            # Добавляем оба значения в метаданные
             metadata["model_id"] = model_id
             metadata["model_name"] = model_name
+            
+            # Если это LLM generation
+            generation_payload = {
+                "name": f"{task_name}:{str(uuid.uuid4())}",
+                "model": model_value,   # <-- Используем имя модели или ID на основе настроек
+                "input": body["messages"],
+                "metadata": metadata,
+                "usage": usage,
+            }
+            if tags_list:
+                generation_payload["tags"] = tags_list
 
-            self.langfuse.end_generation(
-                trace_id=trace.id,
-                name=f"{task_name}:{str(uuid.uuid4())}",
-                model=model_value,
-                input=body["messages"],
-                metadata=metadata,
-                usage=usage,
-                tags=tags_list
-            )
-            self.log(f"Завершен generation для chat_id: {chat_id}")
+            if self.valves.debug:
+                print(f"[DEBUG] Запрос завершения generation Langfuse: {json.dumps(generation_payload, indent=2)}")
+
+            trace.generation().end(**generation_payload)
+            self.log(f"Generation завершен для chat_id: {chat_id}")
         else:
+            # Иначе записываем как событие
+            event_payload = {
+                "name": f"{task_name}:{str(uuid.uuid4())}",
+                "metadata": metadata,
+                "input": body["messages"],
+            }
             if usage:
-                metadata["usage"] = usage
-            self.langfuse.end_event(
-                trace_id=trace.id,
-                name=f"{task_name}:{str(uuid.uuid4())}",
-                metadata=metadata,
-                input=body["messages"],
-                tags=tags_list
-            )
-            self.log(f"Записан event для chat_id: {chat_id}")
+                # Если вы хотите добавить статистику использования в событие
+                event_payload["metadata"]["usage"] = usage
+
+            if tags_list:
+                event_payload["tags"] = tags_list
+
+            if self.valves.debug:
+                print(f"[DEBUG] Запрос завершения event Langfuse: {json.dumps(event_payload, indent=2)}")
+
+            trace.event(**event_payload)
+            self.log(f"Event записан для chat_id: {chat_id}")
 
         return body
 
-    # Вспомогательные функции для получения последнего assistant-сообщения
-    def get_last_assistant_message(self, messages):
-        return next((m["content"] for m in reversed(messages) if m["role"] == "assistant"), None)
-
-    def get_last_assistant_message_obj(self, messages):
-        return next((m for m in reversed(messages) if m["role"] == "assistant"), None)
