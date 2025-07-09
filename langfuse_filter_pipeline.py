@@ -10,17 +10,38 @@ requirements: langfuse
 """
 import uuid
 from typing import Optional
+from pydantic import BaseModel
 
 from langfuse import Langfuse
 from langfuse.api.resources.public import UnauthorizedError
 from openwebui.pipelines import Pipeline as BasePipeline
 
+class Valves(BaseModel):
+    secret_key: str
+    public_key: str
+    host: str
+    debug: bool = False
+    use_model_name_instead_of_id_for_generation: bool = False
+
 class Pipeline(BasePipeline):
-    def __init__(self, valves, model_names, log_func, generation_tasks):
-        self.valves = valves
-        self.model_names = model_names
-        self.log = log_func
-        self.GENERATION_TASKS = generation_tasks
+    def __init__(self, valves=None, model_names=None, log_func=None, generation_tasks=None):
+        # Если valves не переданы, используем дефолтные значения (для UI)
+        if valves is None:
+            self.valves = Valves(
+                secret_key="",
+                public_key="",
+                host="https://cloud.langfuse.com",
+                debug=False,
+                use_model_name_instead_of_id_for_generation=False
+            )
+        elif isinstance(valves, dict):
+            self.valves = Valves(**valves)
+        else:
+            self.valves = valves
+
+        self.model_names = model_names or {}
+        self.log = log_func or (lambda *a, **k: None)
+        self.GENERATION_TASKS = generation_tasks or {"llm_response"}
         self.chat_traces = {}
 
         self.set_langfuse()
@@ -39,6 +60,14 @@ class Pipeline(BasePipeline):
             print("Неверные учетные данные Langfuse. Проверьте настройки.")
         except Exception as e:
             print(f"Ошибка Langfuse: {e}")
+
+    async def on_valves_updated(self, valves):
+        """Этот метод вызывается Open WebUI при изменении переменных через UI."""
+        if isinstance(valves, dict):
+            self.valves = Valves(**valves)
+        else:
+            self.valves = valves
+        self.set_langfuse()
 
     async def inlet(self, body: dict, user: Optional[dict] = None) -> dict:
         chat_id = body.get("chat_id")
@@ -66,7 +95,7 @@ class Pipeline(BasePipeline):
                 trace.update(tags=tags_list)
 
         if task_name in self.GENERATION_TASKS:
-            model_id = self.model_names.get(chat_id, {}).get("id", body["model"])
+            model_id = self.model_names.get(chat_id, {}).get("id", body.get("model"))
             model_name = self.model_names.get(chat_id, {}).get("name", "unknown")
             model_value = model_name if self.valves.use_model_name_instead_of_id_for_generation else model_id
 
@@ -164,4 +193,3 @@ class Pipeline(BasePipeline):
 
     def get_last_assistant_message_obj(self, messages):
         return next((m for m in reversed(messages) if m["role"] == "assistant"), None)
-    
