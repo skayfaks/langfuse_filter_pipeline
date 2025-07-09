@@ -8,14 +8,12 @@ description: A filter pipeline that uses Langfuse.
 type: filter
 requirements: langfuse
 """
-
 import uuid
 from typing import Optional
 
 from langfuse import Langfuse
 from langfuse.api.resources.public import UnauthorizedError
 from openwebui.pipelines import Pipeline as BasePipeline
-
 
 class Pipeline(BasePipeline):
     def __init__(self, valves, model_names, log_func, generation_tasks):
@@ -52,17 +50,14 @@ class Pipeline(BasePipeline):
         if chat_id not in self.chat_traces:
             self.log(f"Создаем новый trace для chat_id: {chat_id}")
 
-            trace_payload = {
-                "name": f"chat:{chat_id}",
-                "input": body,
-                "user_id": user_email,
-                "metadata": metadata,
-                "session_id": chat_id,
-            }
-            if tags_list:
-                trace_payload["tags"] = tags_list
-
-            trace = self.langfuse.trace.create(**trace_payload)
+            trace = self.langfuse.create_trace(
+                name=f"chat:{chat_id}",
+                input=body,
+                user_id=user_email,
+                metadata=metadata,
+                session_id=chat_id,
+                tags=tags_list
+            )
             self.chat_traces[chat_id] = trace
         else:
             trace = self.chat_traces[chat_id]
@@ -78,26 +73,22 @@ class Pipeline(BasePipeline):
             metadata["model_id"] = model_id
             metadata["model_name"] = model_name
 
-            generation_payload = {
-                "name": f"{task_name}:{str(uuid.uuid4())}",
-                "model": model_value,
-                "input": body["messages"],
-                "metadata": metadata,
-            }
-            if tags_list:
-                generation_payload["tags"] = tags_list
-
-            trace.generation.create(**generation_payload)
+            self.langfuse.create_generation(
+                trace_id=trace.id,
+                name=f"{task_name}:{str(uuid.uuid4())}",
+                model=model_value,
+                input=body["messages"],
+                metadata=metadata,
+                tags=tags_list
+            )
         else:
-            event_payload = {
-                "name": f"{task_name}:{str(uuid.uuid4())}",
-                "metadata": metadata,
-                "input": body["messages"],
-            }
-            if tags_list:
-                event_payload["tags"] = tags_list
-
-            trace.event.create(**event_payload)
+            self.langfuse.create_event(
+                trace_id=trace.id,
+                name=f"{task_name}:{str(uuid.uuid4())}",
+                metadata=metadata,
+                input=body["messages"],
+                tags=tags_list
+            )
 
         return body
 
@@ -143,30 +134,26 @@ class Pipeline(BasePipeline):
             metadata["model_id"] = model_id
             metadata["model_name"] = model_name
 
-            generation_payload = {
-                "name": f"{task_name}:{str(uuid.uuid4())}",
-                "model": model_value,
-                "input": body["messages"],
-                "metadata": metadata,
-                "usage": usage,
-            }
-            if tags_list:
-                generation_payload["tags"] = tags_list
-
-            trace.generation.end(**generation_payload)
+            self.langfuse.end_generation(
+                trace_id=trace.id,
+                name=f"{task_name}:{str(uuid.uuid4())}",
+                model=model_value,
+                input=body["messages"],
+                metadata=metadata,
+                usage=usage,
+                tags=tags_list
+            )
             self.log(f"Завершен generation для chat_id: {chat_id}")
         else:
-            event_payload = {
-                "name": f"{task_name}:{str(uuid.uuid4())}",
-                "metadata": metadata,
-                "input": body["messages"],
-            }
             if usage:
-                event_payload["metadata"]["usage"] = usage
-            if tags_list:
-                event_payload["tags"] = tags_list
-
-            trace.event.end(**event_payload)
+                metadata["usage"] = usage
+            self.langfuse.end_event(
+                trace_id=trace.id,
+                name=f"{task_name}:{str(uuid.uuid4())}",
+                metadata=metadata,
+                input=body["messages"],
+                tags=tags_list
+            )
             self.log(f"Записан event для chat_id: {chat_id}")
 
         return body
@@ -177,3 +164,4 @@ class Pipeline(BasePipeline):
 
     def get_last_assistant_message_obj(self, messages):
         return next((m for m in reversed(messages) if m["role"] == "assistant"), None)
+    
